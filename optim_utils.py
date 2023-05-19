@@ -16,6 +16,7 @@ from sentence_transformers.util import (semantic_search,
                                         dot_score, 
                                         normalize_embeddings)
 
+from transformers import AutoProcessor, BlipForConditionalGeneration # for image captioning
 
 def read_json(filename: str) -> Mapping[str, Any]:
     """Returns a Python dict representation of JSON object at input file."""
@@ -103,13 +104,29 @@ def get_target_feature(model, preprocess, tokenizer_funct, device, target_images
 
     return all_target_features
 
+def generate_caption(image: Image, args, prefix:str=""):
+    processor = AutoProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+    conditioned = prefix is not None
+    text = prefix if conditioned else ""
+    inputs = processor(images=image, text=text, return_tensors="pt")
+    outputs = model.generate(**inputs, max_length=args.prompt_len-1)
+    results = processor.decode(outputs[0], skip_special_tokens=True)
+    
+    return results
 
-def initialize_prompt(tokenizer, token_embedding, args, device):
+def initialize_prompt(tokenizer, token_embedding, args, device, target_images=None):
     prompt_len = args.prompt_len
-
+    init_from_caption=target_images is not None
     # randomly optimize prompt embeddings
-    prompt_ids = torch.randint(len(tokenizer.encoder), (args.prompt_bs, prompt_len)).to(device)
+    if init_from_caption:
+        caption = generate_caption(target_images, args)
+        prompt_ids = tokenizer.encode(caption, return_tensors='pt').to(device)
+        
+    else:
+        prompt_ids = torch.randint(len(tokenizer.encoder), (args.prompt_bs, prompt_len)).to(device)
     prompt_embeds = token_embedding(prompt_ids).detach()
+    print(prompt_embeds.shape)
     prompt_embeds.requires_grad = True
 
     # initialize the template
@@ -132,7 +149,7 @@ def initialize_prompt(tokenizer, token_embedding, args, device):
     return prompt_embeds, dummy_embeds, dummy_ids
 
 
-def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device):
+def optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device, target_images):
     opt_iters = args.iter
     lr = args.lr
     weight_decay = args.weight_decay
@@ -228,7 +245,7 @@ def optimize_prompt(model, preprocess, args, device, target_images=None, target_
     all_target_features = get_target_feature(model, preprocess, tokenizer_funct, device, target_images=target_images, target_prompts=target_prompts)
 
     # optimize prompt
-    learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device)
+    learned_prompt = optimize_prompt_loop(model, tokenizer, token_embedding, all_target_features, args, device, target_images=target_images)
 
     return learned_prompt
     
@@ -248,3 +265,53 @@ def measure_similarity(orig_images, images, ref_model, ref_clip_preprocess, devi
         gen_feat = gen_feat / gen_feat.norm(dim=1, keepdim=True)
         
         return (ori_feat @ gen_feat.t()).mean().item()
+
+if __name__ == "__main__":
+    import argparse
+    from diffusers import DPMSolverMultistepScheduler
+    from modified_stable_diffusion_pipeline import ModifiedStableDiffusionPipeline
+    import torch
+    from torchvision import transforms
+
+    args_parser = argparse.ArgumentParser()
+    args_parser.add_argument("--prompt_len", type=int, default=8)
+
+    device = "cuda:1"
+
+    model_id = "stabilityai/stable-diffusion-2-1-base"
+    scheduler = DPMSolverMultistepScheduler.from_pretrained(model_id, subfolder="scheduler")
+
+    weight_dtype = torch.float32
+
+    pipe = ModifiedStableDiffusionPipeline.from_pretrained(
+        model_id,
+        scheduler=scheduler,
+        torch_dtype=weight_dtype,
+        revision="fp16",
+        )
+    pipe = pipe.to(device)
+
+    pipe.vae.requires_grad_(False)
+    pipe.unet.requires_grad_(True)
+    pipe.unet.train()
+
+    image_length = 512
+
+    tokenizer = pipe.tokenizer
+    token_embedding = pipe.text_encoder.text_model.embeddings.token_embedding
+
+    preprocess = transforms.Compose(
+        [
+            transforms.Resize(512, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(512),
+            transforms.ToTensor(),
+        ]
+    )
+
+    args = args_parser.parse_args()
+
+    image = Image.open("image.jpg").convert('RGB')
+    caption = generate_caption(image, args)
+    print(caption)
+
+    prompt_embeds, dummy_embeds, dummy_ids = initialize_prompt(tokenizer, token_embedding, args, device, image)
